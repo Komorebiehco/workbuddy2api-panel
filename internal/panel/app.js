@@ -157,7 +157,7 @@ async function loadOverview(quiet) {
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
-    $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
+    $('navRedis').textContent = d.supabase_persistence ? 'Supabase 持久化' : (d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存');
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
     p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));

@@ -151,6 +151,9 @@ func Parse(raw []byte) (*Auth, error) {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
 	a.document = append([]byte(nil), raw...)
+	if a.ExpiresAt >= 1_000_000_000_000 {
+		a.ExpiresAt /= 1000
+	}
 	return &a, nil
 }
 
@@ -308,6 +311,11 @@ func marshalAuth(a *Auth) ([]byte, error) {
 			target = map[string]any{}
 		}
 		for key, value := range values {
+			if section == "auth" && key == "expiresAt" {
+				if original, ok := target[key].(float64); ok && original >= 1_000_000_000_000 {
+					value = a.ExpiresAt * 1000
+				}
+			}
 			target[key] = value
 		}
 		doc[section] = target

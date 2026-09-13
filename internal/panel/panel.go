@@ -27,13 +27,14 @@ import (
 
 // Config 面板依赖（main 装配注入）。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
-	AuthDir   string               // OAuth 登录完成后凭证落盘目录
-	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	Pool       *pool.Pool
+	Upstream   *upstream.Client
+	Scheduler  *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
+	AuthDir    string               // OAuth 登录完成后凭证落盘目录
+	APIKey     string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
+	RedisMode  string               // "upstash" / "noop"，仅观测透出
+	Persistent bool
+	Version    string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -188,17 +189,18 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		sticky = p.cfg.StickyCount()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         p.cfg.Version,
-		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
-		"redis_mode":      p.cfg.RedisMode,
-		"sticky_sessions": sticky,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"version":              p.cfg.Version,
+		"uptime_sec":           int(time.Since(p.started).Seconds()),
+		"auth_required":        p.apiKey() != "",
+		"redis_mode":           p.cfg.RedisMode,
+		"supabase_persistence": p.cfg.Persistent,
+		"sticky_sessions":      sticky,
+		"total":                total,
+		"healthy":              healthy,
+		"cooling":              cooling,
+		"disabled":             disabled,
+		"in_flight_full":       inFlightFull,
+		"accounts":             p.cfg.Pool.List(),
 	})
 }
 

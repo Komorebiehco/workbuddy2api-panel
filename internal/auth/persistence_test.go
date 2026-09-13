@@ -174,3 +174,23 @@ func TestFernetRoundtripTamperingAndWrongKey(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyMillisecondExpiryRoundtrip(t *testing.T) {
+	a, err := Parse([]byte(`{"auth":{"accessToken":"token","expiresAt":1700000000000},"account":{"uid":"u1"}}`))
+	if err != nil || a.ExpiresAt != 1700000000 || !a.NeedsRefresh(0) {
+		t.Fatal("legacy milliseconds were treated as seconds")
+	}
+	a.ExpiresAt = 1900000000
+	raw, err := marshalAuth(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Auth struct {
+			ExpiresAt int64 `json:"expiresAt"`
+		} `json:"auth"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil || doc.Auth.ExpiresAt != 1900000000000 {
+		t.Fatal("legacy timestamp units were not preserved for rollback compatibility")
+	}
+}

@@ -299,6 +299,9 @@ func (c *Client) chatHTTP() *http.Client {
 }
 
 func (c *Client) chatBase(a *auth.Auth) string {
+	if host := internationalHost(a); host != "" {
+		return "https://" + host
+	}
 	return c.ChatBaseCN
 }
 
@@ -322,6 +325,9 @@ func (c *Client) effortsSnapshot() map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
+	if host := internationalHost(a); host != "" {
+		return "https://" + host
+	}
 	return c.BillingBaseCN
 }
 
@@ -442,28 +448,34 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
 type ModelInfo struct {
-	ID            string
-	Name          string
-	ContextWindow int64    // = maxInputTokens
-	MaxTokens     int64    // = maxOutputTokens（思考与最终回答共享此预算，上游无独立思考上限字段）
-	MaxAllowedSize int64   // = maxAllowedSize（单请求体大小上限，通常等于 maxInputTokens）
-	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
-	DefaultEffort string   // reasoning.defaultEffort（新模型键）或 reasoning.effort（老模型键）；空=未返回
-	CanDisableThinking bool  // reasoning.canDisableThinking：思考可关（off 档可用）
-	SupportsReasoning  bool   // supportsReasoning：模型支持思考
-	Credits       string   // credits：积分倍率（如 "x0.79"）
+	ID                 string
+	Name               string
+	ContextWindow      int64    // = maxInputTokens
+	MaxTokens          int64    // = maxOutputTokens（思考与最终回答共享此预算，上游无独立思考上限字段）
+	MaxAllowedSize     int64    // = maxAllowedSize（单请求体大小上限，通常等于 maxInputTokens）
+	Efforts            []string // reasoning.supportedEfforts（空=未知/固定档）
+	DefaultEffort      string   // reasoning.defaultEffort（新模型键）或 reasoning.effort（老模型键）；空=未返回
+	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）
+	SupportsReasoning  bool     // supportsReasoning：模型支持思考
+	Credits            string   // credits：积分倍率（如 "x0.79"）
 }
 
 // FetchModels 调上游动态模型接口。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	url := c.chatBase(a) + "/console/enterprises/personal/models"
+	if internationalHost(a) != "" {
+		url = c.chatBase(a) + "/v3/config"
+	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	if internationalHost(a) != "" {
+		c.ChatHeaders(req, a)
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -486,7 +498,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				Credits           string `json:"credits"`
 				SupportsReasoning bool   `json:"supportsReasoning"`
 				Reasoning         struct {
-					Effort             string   `json:"effort"`         // 老模型键（auto/hy3/glm-5.2 系）
+					Effort             string   `json:"effort"`        // 老模型键（auto/hy3/glm-5.2 系）
 					DefaultEffort      string   `json:"defaultEffort"` // 新模型键（glm-5.3 系只返回这个）
 					CanDisableThinking bool     `json:"canDisableThinking"`
 					SupportedEfforts   []string `json:"supportedEfforts"`
@@ -505,14 +517,18 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return nil, fmt.Errorf("models api code=%d", env.Code)
 	}
 	var cliIDs []string
+	agentName := "cli"
+	if internationalHost(a) == "www.workbuddy.ai" {
+		agentName = "coordinator"
+	}
 	for _, ag := range env.Data.Agents {
-		if ag.Name == "cli" {
+		if ag.Name == agentName {
 			cliIDs = ag.Models
 			break
 		}
 	}
 	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
+		return nil, fmt.Errorf("no %s agent models found", agentName)
 	}
 	type parsed struct {
 		mi       ModelInfo

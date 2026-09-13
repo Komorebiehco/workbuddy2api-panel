@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -14,7 +15,24 @@ const (
 )
 
 func originRefererFor(a *auth.Auth) string {
+	if host := internationalHost(a); host != "" {
+		return "https://" + host
+	}
 	return originRefererCN
+}
+
+// Only route migrated credentials to known product hosts, never to an arbitrary domain.
+func internationalHost(a *auth.Auth) string {
+	if a == nil {
+		return ""
+	}
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(a.Domain)), "https://"), "/")
+	switch host {
+	case "www.workbuddy.ai", "www.codebuddy.ai":
+		return host
+	default:
+		return ""
+	}
 }
 
 // userAgent 返回当前出站 UA：Client.UserAgent 非空则覆盖（全部出站请求生效），
@@ -35,6 +53,14 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", c.userAgent())
+	if internationalHost(a) == "www.workbuddy.ai" {
+		if c.UserAgent == "" {
+			req.Header.Set("User-Agent", "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1")
+		}
+		req.Header.Set("X-IDE-Type", "WorkBuddy")
+		req.Header.Set("X-IDE-Name", "WorkBuddy")
+		req.Header.Set("X-IDE-Version", "5.5.2")
+	}
 }
 
 // ChatHeaders 在 common 之上加 chat 专属的账号头。
@@ -95,4 +121,7 @@ func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}
 	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
+	if internationalHost(a) != "" {
+		req.Header.Set("X-Domain", a.Domain)
+	}
 }

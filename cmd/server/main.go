@@ -244,6 +244,7 @@ func main() {
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,
 		RedisMode:   redisMode,
+		Persistent:  remoteStore != nil,
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,

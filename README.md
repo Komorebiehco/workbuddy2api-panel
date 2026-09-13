@@ -317,17 +317,34 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 `WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
-### Render / Supabase 凭证持久化
+### Render / Supabase 持久化
 
 配置 `WB2A_CREDENTIALS_DATABASE_URL` 与
 `WB2A_CREDENTIALS_ENCRYPTION_KEY` 后，账号凭证会使用 Fernet 加密保存到
 Supabase PostgreSQL 的 `codebuddy_credentials` 表；`auths/` 仅作为本地热缓存。
 启动时远端凭证会恢复到 `auths/`，面板登录、token 刷新和删除会同步更新远端。
+刷新保存失败会返回错误并每 15 秒重试；未提交成功的数据不能承诺在实例突然销毁后恢复。
+数据库已有任何记录后不再自动导入本地缓存，删除标记不会被普通 token 刷新复活。
+
+面板配置与账号池快照加密保存到同一数据库的 `workbuddy_documents` 表，
+启动时在读取本地文件之前恢复配置；新容器没有 `state.json` 时也能恢复远端状态。
+池状态沿用每 5 秒批量保存与退出前刷新，远端写入失败会重试。
+数据库不可读时启动失败，不会静默以空账号或默认配置覆盖远端数据。
+日志环形缓冲、进行中的 OAuth 授权和未配置 Redis 时的会话粘性仍在内存中。
 
 为兼容旧版 `codebuddy2api` 的既有部署，也接受同值的
 `CODEBUDDY_CREDENTIALS_DATABASE_URL` 与
 `CODEBUDDY_CREDENTIALS_ENCRYPTION_KEY`。Render Free 实例重启或重新部署后，
 凭证仍从 Supabase 恢复，不依赖本地磁盘。
+
+Render 环境同时设置 `PORT=7863`、`WB2A_LISTEN=:7863`、
+`WB2A_AUTH_DIR=/app/auths`、`WB2A_STATE_FILE=/app/data/state.json`。
+健康检查使用 `/panel/`，面板与 API 使用 `WB2A_API_KEY`；
+环境变量管理的 key 需在 Render 修改，不能在面板中覆盖。
+`/` 与旧版 `/dashboard` 会跳转到 `/panel/`。
+旧版毫秒格式的凭证过期时间可直接迁移；已有 `www.workbuddy.ai` /
+`www.codebuddy.ai` 账号的聊天、刷新、余额与模型列表使用固定白名单中的同产品国际站入口。
+上游面板的 OAuth 添加账号流程和成长任务仍面向国内站，未宣称国际站任务兼容。
 
 ## 核心行为语义
 
