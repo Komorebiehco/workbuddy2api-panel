@@ -67,3 +67,29 @@ func TestCatalogCacheIsolatedBetweenHandlers(t *testing.T) {
 		}
 	}
 }
+
+func TestEmptyPoolPreservesStaticModels(t *testing.T) {
+	h := NewHandler(Config{Pool: testPoolWith(), Upstream: upstream.New()})
+	if len(h.modelList()) != len(staticModels) {
+		t.Fatal("empty legacy pool should retain its static model listing")
+	}
+}
+
+func TestSingleSiteCanTryNewModelBeforeCatalogRefresh(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[{"id":"old-model"}],"agents":[]}}`, false
+	})
+	a := &auth.Auth{UID: "intl", AccessToken: "at", Domain: "www.workbuddy.ai", ExpiresAt: 9999999999}
+	if _, err := up.FetchModels(a); err != nil {
+		t.Fatal(err)
+	}
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(sseOK))}, nil
+	})
+	h := NewHandler(Config{Pool: testPoolWith(a), Upstream: up})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"new-model","messages":[]}`)))
+	if w.Code != 200 {
+		t.Fatalf("old catalog blocked a single-site request: %d", w.Code)
+	}
+}

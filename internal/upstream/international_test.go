@@ -113,6 +113,19 @@ func TestInternationalGrowthMakesNoRequests(t *testing.T) {
 	}
 }
 
+func TestEmptyCatalogDoesNotBlockAnUnknownModel(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"models":[],"agents":[]}}`), nil
+	})
+	a := &auth.Auth{UID: "intl", Domain: "www.workbuddy.ai", AccessToken: "token"}
+	if _, err := c.FetchModels(a); err == nil {
+		t.Fatal("empty remote catalog should not become an authoritative cache entry")
+	}
+	if !c.ModelAvailable(a, "new-model") {
+		t.Fatal("failed catalog should leave model support unknown")
+	}
+}
+
 func TestInternationalRoutingRejectsArbitraryDestinations(t *testing.T) {
 	c := New()
 	for _, domain := range []string{"www.workbuddy.ai.evil.example", "https://www.workbuddy.ai@evil.example", "http://www.workbuddy.ai", "www.workbuddy.ai:444", "www.workbuddy.ai/path", "127.0.0.1"} {

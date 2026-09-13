@@ -252,7 +252,7 @@ type Client struct {
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	effortsMu sync.RWMutex
 	efforts   map[string][]string
-	catalogs  map[string][]ModelInfo
+	catalogs  map[string]catalogSnapshot
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
@@ -525,6 +525,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("models api returned empty list")
+	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
 	cache := make(map[string][]string, len(out))
 	for _, mi := range out {
@@ -535,9 +538,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.effortsMu.Lock()
 	c.efforts = cache
 	if c.catalogs == nil {
-		c.catalogs = make(map[string][]ModelInfo)
+		c.catalogs = make(map[string]catalogSnapshot)
 	}
-	c.catalogs[catalogKey(a)] = out
+	c.catalogs[catalogKey(a)] = catalogSnapshot{models: out, fetched: time.Now()}
 	c.effortsMu.Unlock()
 	return out, nil
 }

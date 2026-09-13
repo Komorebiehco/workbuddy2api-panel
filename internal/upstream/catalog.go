@@ -4,14 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
 func catalogKey(a *auth.Auth) string {
 	site, _ := auth.ResolveSite(a)
-	key, _ := json.Marshal([3]string{site.Host, a.UID, a.EnterpriseID})
+	key, _ := json.Marshal([4]string{site.Host, a.UID, a.EnterpriseID, fmt.Sprintf("%p", a)})
 	return string(key)
+}
+
+type catalogSnapshot struct {
+	models  []ModelInfo
+	fetched time.Time
 }
 
 // Unknown catalogs remain permissive; a known catalog is authoritative for that account.
@@ -21,11 +27,11 @@ func (c *Client) ModelAvailable(a *auth.Auth, id string) bool {
 	}
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	models, known := c.catalogs[catalogKey(a)]
-	if !known {
+	catalog, known := c.catalogs[catalogKey(a)]
+	if !known || time.Since(catalog.fetched) > time.Hour {
 		return true
 	}
-	for _, m := range models {
+	for _, m := range catalog.models {
 		if m.ID == id {
 			return true
 		}
@@ -35,8 +41,12 @@ func (c *Client) ModelAvailable(a *auth.Auth, id string) bool {
 
 func (c *Client) prepareBodyFor(a *auth.Auth, body []byte) []byte {
 	c.effortsMu.RLock()
-	models := c.catalogs[catalogKey(a)]
+	catalog := c.catalogs[catalogKey(a)]
 	c.effortsMu.RUnlock()
+	models := catalog.models
+	if time.Since(catalog.fetched) > time.Hour {
+		models = nil
+	}
 	efforts := make(map[string][]string, len(models))
 	for _, m := range models {
 		if len(m.Efforts) > 0 {

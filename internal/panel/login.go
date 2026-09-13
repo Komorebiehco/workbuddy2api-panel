@@ -32,6 +32,7 @@ type loginSession struct {
 	Site    auth.Site
 	State   string
 	Busy    bool
+	Token   json.RawMessage
 	Result  map[string]any
 }
 
@@ -155,7 +156,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	linkSite, err := auth.ResolveSite(&auth.Auth{Domain: link.Host})
-	if err != nil || linkSite.International != site.International {
+	if err != nil || linkSite != site {
 		writeErr(w, http.StatusBadGateway, "auth state: unexpected authorization site")
 		return
 	}
@@ -219,11 +220,14 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	query := "?state=" + url.QueryEscape(session.State)
 
 	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
-	tokRaw, _, err := loginJSON(session.Site, http.MethodGet, "/v2/plugin/auth/token"+query, "", "", nil)
-	if err != nil {
-		// pending / 未完成：面板前端继续轮询。
-		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
-		return
+	tokRaw := session.Token
+	if len(tokRaw) == 0 {
+		var err error
+		tokRaw, _, err = loginJSON(session.Site, http.MethodGet, "/v2/plugin/auth/token"+query, "", "", nil)
+		if err != nil {
+			writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
+			return
+		}
 	}
 	var tok struct {
 		AccessToken  string `json:"accessToken"`
@@ -243,6 +247,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "login token does not match the selected site and product")
 		return
 	}
+	session.Token = append(json.RawMessage(nil), tokRaw...)
 
 	// 完成：取 uid/nickname（失败不阻塞，仅缺展示名）。
 	var acct struct {
@@ -285,20 +290,29 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.FilePath = filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID))
+	p.loginSaveMu.Lock()
+	if time.Since(session.Created) > loginTTL {
+		p.loginSaveMu.Unlock()
+		writeErr(w, http.StatusNotFound, "login session expired before credential save")
+		return
+	}
 	if previous := p.cfg.Pool.AuthByUID(acct.UID); previous != nil {
 		previousSite, err := auth.ResolveSite(previous)
 		if err != nil || previousSite != tokenSite {
+			p.loginSaveMu.Unlock()
 			writeErr(w, http.StatusConflict, "account UID already belongs to a different site or product")
 			return
 		}
 		a.RemoteName = previous.RemoteName
 	}
 	if err := a.SaveNew(); err != nil {
+		p.loginSaveMu.Unlock()
 		writeErr(w, http.StatusInternalServerError, "save auth: "+err.Error())
 		return
 	}
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
+	p.loginSaveMu.Unlock()
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
 	checkinMsg := ""
@@ -321,6 +335,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"checkin_message": checkinMsg,
 	}
 	p.loginMu.Lock()
+	session.Token = nil
 	session.Result = result
 	p.loginMu.Unlock()
 	log.Printf("panel: OAuth account loaded site=%s uid=%s", tokenSite.Host, acct.UID)

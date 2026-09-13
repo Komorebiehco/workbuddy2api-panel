@@ -257,7 +257,11 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		return out
 	}
-	for _, st := range h.cfg.Pool.List() {
+	accounts := h.cfg.Pool.List()
+	if len(accounts) == 0 {
+		return staticModels
+	}
+	for _, st := range accounts {
 		a := h.cfg.Pool.AuthByUID(st.UID)
 		if site, err := auth.ResolveSite(a); err == nil && !site.International && !st.Disabled {
 			return staticModels
@@ -377,10 +381,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(sites) > 1 {
 		h.fetchDynamicModels()
-	}
-	for _, account := range h.cfg.Pool.List() {
-		if a := h.cfg.Pool.AuthByUID(account.UID); a != nil && !h.cfg.Upstream.ModelAvailable(a, peek.Model) {
-			tried[account.UID] = true
+		for _, account := range h.cfg.Pool.List() {
+			if a := h.cfg.Pool.AuthByUID(account.UID); a != nil && !h.cfg.Upstream.ModelAvailable(a, peek.Model) {
+				tried[account.UID] = true
+			}
 		}
 	}
 

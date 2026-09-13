@@ -62,8 +62,9 @@ type Panel struct {
 
 	// logins 进行中的 OAuth 设备授权会话（state → 创建时刻）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
-	loginMu sync.Mutex
-	logins  map[string]*loginSession
+	loginMu     sync.Mutex
+	loginSaveMu sync.Mutex
+	logins      map[string]*loginSession
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，

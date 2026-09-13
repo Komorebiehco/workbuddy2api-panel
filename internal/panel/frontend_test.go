@@ -56,3 +56,12 @@ func TestIndexHTMLNoInlineScript(t *testing.T) {
 		rest = rest[end:]
 	}
 }
+
+func TestHiddenStateIsNotOverriddenByFlexDisplay(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	if !strings.Contains(rec.Body.String(), "[hidden] { display: none !important; }") {
+		t.Fatal("hidden loading and error states can be exposed by component display styles")
+	}
+}
