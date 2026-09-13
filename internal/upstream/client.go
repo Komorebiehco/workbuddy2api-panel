@@ -252,6 +252,7 @@ type Client struct {
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	effortsMu sync.RWMutex
 	efforts   map[string][]string
+	catalogs  map[string][]ModelInfo
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
@@ -281,8 +282,8 @@ func New() *Client {
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
 	return &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr, CheckRedirect: rejectRedirect},
+		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr, CheckRedirect: rejectRedirect},
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
@@ -299,8 +300,12 @@ func (c *Client) chatHTTP() *http.Client {
 }
 
 func (c *Client) chatBase(a *auth.Auth) string {
-	if host := internationalHost(a); host != "" {
-		return "https://" + host
+	site, err := auth.ResolveSite(a)
+	if err != nil {
+		return ""
+	}
+	if site.International || site.WorkBuddy {
+		return "https://" + site.Host
 	}
 	return c.ChatBaseCN
 }
@@ -325,8 +330,12 @@ func (c *Client) effortsSnapshot() map[string][]string {
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
-	if host := internationalHost(a); host != "" {
-		return "https://" + host
+	site, err := auth.ResolveSite(a)
+	if err != nil {
+		return ""
+	}
+	if site.International || site.WorkBuddy {
+		return "https://" + site.Host
 	}
 	return c.BillingBaseCN
 }
@@ -377,6 +386,10 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	a.Lock()
 	defer a.Unlock()
+	before, err := auth.ResolveSite(a)
+	if err != nil {
+		return err
+	}
 	if strings.TrimSpace(a.RefreshToken) == "" {
 		return fmt.Errorf("no refreshToken")
 	}
@@ -399,13 +412,19 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return fmt.Errorf("refresh_failed: no accessToken in response — re-login required")
 	}
+	domain := tok.Domain
+	if domain == "" {
+		domain = before.Host
+	}
+	after, err := auth.ResolveSite(&auth.Auth{Domain: domain, AccessToken: tok.AccessToken})
+	if err != nil || after != before {
+		return fmt.Errorf("refresh returned a conflicting credential site")
+	}
 	a.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
 		a.RefreshToken = tok.RefreshToken
 	}
-	if tok.Domain != "" {
-		a.Domain = tok.Domain
-	}
+	a.Domain = after.Host
 	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
 	if tok.ExpiresIn > 0 {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
@@ -417,8 +436,11 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	if _, err := auth.ResolveSite(a); err != nil {
+		return nil, 0, nil, err
+	}
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBodyFor(a, body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -463,8 +485,12 @@ type ModelInfo struct {
 // FetchModels 调上游动态模型接口。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	site, err := auth.ResolveSite(a)
+	if err != nil {
+		return nil, err
+	}
 	url := c.chatBase(a) + "/console/enterprises/personal/models"
-	if internationalHost(a) != "" {
+	if site.International || site.WorkBuddy {
 		url = c.chatBase(a) + "/v3/config"
 	}
 	req, err := http.NewRequest(http.MethodGet, url, nil)
@@ -473,8 +499,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
-	if internationalHost(a) != "" {
+	if site.International || site.WorkBuddy {
 		c.ChatHeaders(req, a)
+		if !site.WorkBuddy {
+			req.Header.Set("x-client-platform", "cli")
+		}
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -485,82 +514,16 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
-	var env struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []struct {
-				ID                string `json:"id"`
-				Name              string `json:"name"`
-				MaxInputTokens    int64  `json:"maxInputTokens"`
-				MaxOutputTokens   int64  `json:"maxOutputTokens"`
-				MaxAllowedSize    int64  `json:"maxAllowedSize"`
-				Disabled          bool   `json:"disabled"`
-				Credits           string `json:"credits"`
-				SupportsReasoning bool   `json:"supportsReasoning"`
-				Reasoning         struct {
-					Effort             string   `json:"effort"`        // 老模型键（auto/hy3/glm-5.2 系）
-					DefaultEffort      string   `json:"defaultEffort"` // 新模型键（glm-5.3 系只返回这个）
-					CanDisableThinking bool     `json:"canDisableThinking"`
-					SupportedEfforts   []string `json:"supportedEfforts"`
-				} `json:"reasoning"`
-			} `json:"models"`
-			Agents []struct {
-				Name   string   `json:"name"`
-				Models []string `json:"models"`
-			} `json:"agents"`
-		} `json:"data"`
-	}
+	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
 	}
 	if env.Code != 0 {
 		return nil, fmt.Errorf("models api code=%d", env.Code)
 	}
-	var cliIDs []string
-	agentName := "cli"
-	if internationalHost(a) == "www.workbuddy.ai" {
-		agentName = "coordinator"
-	}
-	for _, ag := range env.Data.Agents {
-		if ag.Name == agentName {
-			cliIDs = ag.Models
-			break
-		}
-	}
-	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no %s agent models found", agentName)
-	}
-	type parsed struct {
-		mi       ModelInfo
-		disabled bool
-	}
-	dynMap := make(map[string]parsed, len(env.Data.Models))
-	for _, m := range env.Data.Models {
-		def := m.Reasoning.Effort
-		if def == "" {
-			def = m.Reasoning.DefaultEffort // 新旧双键兼容：glm-5.3 系只返回 defaultEffort
-		}
-		dynMap[m.ID] = parsed{ModelInfo{
-			ID:                 m.ID,
-			Name:               m.Name,
-			ContextWindow:      m.MaxInputTokens,
-			MaxTokens:          m.MaxOutputTokens,
-			MaxAllowedSize:     m.MaxAllowedSize,
-			Efforts:            m.Reasoning.SupportedEfforts,
-			DefaultEffort:      def,
-			CanDisableThinking: m.Reasoning.CanDisableThinking,
-			SupportsReasoning:  m.SupportsReasoning,
-			Credits:            m.Credits,
-		}, m.Disabled}
-	}
-	out := make([]ModelInfo, 0, len(cliIDs))
-	for _, id := range cliIDs {
-		if pm, ok := dynMap[id]; ok && !pm.disabled {
-			out = append(out, pm.mi)
-		}
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+	out, err := selectProductModels(env.Data, site.WorkBuddy)
+	if err != nil {
+		return nil, err
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
 	cache := make(map[string][]string, len(out))
@@ -571,6 +534,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	c.effortsMu.Lock()
 	c.efforts = cache
+	if c.catalogs == nil {
+		c.catalogs = make(map[string][]ModelInfo)
+	}
+	c.catalogs[catalogKey(a)] = out
 	c.effortsMu.Unlock()
 	return out, nil
 }

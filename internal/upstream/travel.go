@@ -44,6 +44,9 @@ type TravelState struct {
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	if err := requireDomestic(a); err != nil {
+		return nil, err
+	}
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)

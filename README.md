@@ -34,6 +34,19 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 ## 核心能力
 
+### 国内与国际账号
+
+面板「添加账号」可选择国内或国际的 WorkBuddy / CodeBuddy CLI。
+凭证的 `domain` 与 JWT `iss` 共同决定固定的产品入口；地域或产品冲突时拒绝请求，
+不会把国际 token 回退发送到国内站。未提供站点信息的旧凭证继续按国内 CLI 处理。
+
+- 国际账号支持浏览器 OAuth、模型目录、OpenAI 兼容对话、余额查询、token 自动刷新。
+- WorkBuddy 模型目录按 agent 的 `default` 标记选择，并兼容 CLI 回退、模型 ID、名称、别名和对象引用。
+- `/v1/models` 汇总当前账号的动态模型目录；已知模型权限参与选号，推理档位按账号隔离。
+- 国际账号不执行国内专属签到、成长奖励和行为任务；对应面板操作返回 501，后台自动跳过。
+- Supabase 凭证、配置、账号池状态持久化仍生效，刷新后的凭证保留原始 `.info` 名称与未知字段。
+- 国际支持参考 [Komorebiehco/codebuddy2api](https://github.com/Komorebiehco/codebuddy2api) 的固定站点路由、OAuth 和产品模型目录实现。
+
 | 能力 | 说明 |
 |---|---|
 | 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |

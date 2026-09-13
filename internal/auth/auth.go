@@ -150,6 +150,9 @@ func Parse(raw []byte) (*Auth, error) {
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
+	if _, err := ResolveSite(&a); err != nil {
+		return nil, err
+	}
 	a.document = append([]byte(nil), raw...)
 	if a.ExpiresAt >= 1_000_000_000_000 {
 		a.ExpiresAt /= 1000

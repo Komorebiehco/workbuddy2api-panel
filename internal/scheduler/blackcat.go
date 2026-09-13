@@ -21,7 +21,7 @@ func (s *Scheduler) RunBlackcatNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessToken == "" || !supportsGrowth(a) {
 			continue
 		}
 		need, err := s.cfg.Upstream.BlackcatNeed(a)

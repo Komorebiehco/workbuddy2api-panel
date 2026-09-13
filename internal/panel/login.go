@@ -1,4 +1,4 @@
-// login.go 面板内嵌的 WorkBuddy CN OAuth 设备授权流程（cmd/login 的进程内移植）。
+// login.go 面板内嵌的国内/国际 OAuth 设备授权流程。
 //
 //	POST /panel/api/login/start → 拿 state+authUrl，state 存进程内（不再落 /tmp，
 //	  原方案在 Windows 上不可用），返回授权 URL；
@@ -11,37 +11,36 @@ package panel
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-const (
-	upstreamBaseCN    = "https://copilot.tencent.com"
-	clientUA          = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer     = "https://www.codebuddy.cn"
-	endpointAuthState = upstreamBaseCN + "/v2/plugin/auth/state?platform=CLI"
-	endpointLoginAcct = upstreamBaseCN + "/v2/plugin/login/account?state="
-	endpointAuthToken = upstreamBaseCN + "/v2/plugin/auth/token?state="
-)
+type loginSession struct {
+	Created time.Time
+	Site    auth.Site
+	State   string
+	Busy    bool
+	Result  map[string]any
+}
 
 // loginHTTP 设备授权专用 client：短超时、无 cookie（每请求携带 state，无会话态）。
-var loginHTTP = &http.Client{Timeout: 30 * time.Second}
-
-func commonHeaders(req *http.Request) {
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", originReferer)
-	req.Header.Set("Referer", originReferer+"/")
-	req.Header.Set("User-Agent", clientUA)
+var loginHTTP = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 // validUID 校验上游返回的 uid 是否可安全用于拼文件名。
@@ -69,14 +68,21 @@ type apiEnvelope struct {
 }
 
 // doJSON 发一次 JSON 请求并解信封。
-func doJSON(method, fullURL string, bearer string, body io.Reader) (json.RawMessage, int, error) {
-	req, err := http.NewRequest(method, fullURL, body)
+func loginJSON(site auth.Site, method, path, bearer, domain string, body io.Reader) (json.RawMessage, int, error) {
+	base := "https://" + site.Host
+	if !site.International && !site.WorkBuddy {
+		base = "https://copilot.tencent.com"
+	}
+	req, err := http.NewRequest(method, base+path, body)
 	if err != nil {
 		return nil, 0, err
 	}
-	commonHeaders(req)
+	(&upstream.Client{}).CommonHeaders(req, &auth.Auth{Domain: site.Host})
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	if domain != "" {
+		req.Header.Set("X-Domain", domain)
 	}
 	resp, err := loginHTTP.Do(req)
 	if err != nil {
@@ -99,7 +105,38 @@ func doJSON(method, fullURL string, bearer string, body io.Reader) (json.RawMess
 
 // loginStart 发起设备授权：POST auth/state 拿授权 URL。
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
-	data, status, err := doJSON(http.MethodPost, endpointAuthState, "", bytes.NewReader([]byte("{}")))
+	var input struct {
+		Site    string `json:"site"`
+		Product string `json:"product"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&input); err != nil && err != io.EOF {
+		writeErr(w, http.StatusBadRequest, "invalid login options")
+		return
+	}
+	if input.Site == "" {
+		input.Site = "cn"
+	}
+	if input.Product == "" {
+		input.Product = "cli"
+		if input.Site == "intl" {
+			input.Product = "workbuddy"
+		}
+	}
+	host := map[string]string{
+		"cn:cli": "www.codebuddy.cn", "cn:workbuddy": "www.workbuddy.cn",
+		"intl:cli": "www.codebuddy.ai", "intl:workbuddy": "www.workbuddy.ai",
+	}[input.Site+":"+input.Product]
+	if host == "" {
+		writeErr(w, http.StatusBadRequest, "invalid login site or product")
+		return
+	}
+	site, _ := auth.ResolveSite(&auth.Auth{Domain: host})
+	platform := "CLI"
+	if site.WorkBuddy {
+		platform = "workbuddy"
+	}
+	data, status, err := loginJSON(site, http.MethodPost,
+		"/v2/plugin/auth/state?platform="+platform, "", "", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
@@ -112,17 +149,38 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "auth state: missing state or authUrl")
 		return
 	}
+	link, err := url.Parse(st.AuthURL)
+	if err != nil || link.Scheme != "https" || link.User != nil {
+		writeErr(w, http.StatusBadGateway, "auth state: invalid authorization URL")
+		return
+	}
+	linkSite, err := auth.ResolveSite(&auth.Auth{Domain: link.Host})
+	if err != nil || linkSite.International != site.International {
+		writeErr(w, http.StatusBadGateway, "auth state: unexpected authorization site")
+		return
+	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		writeErr(w, http.StatusInternalServerError, "cannot create login session")
+		return
+	}
+	loginID := hex.EncodeToString(id[:])
 	p.loginMu.Lock()
 	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
-	for s, created := range p.logins {
-		if time.Since(created) > loginTTL {
+	for s, session := range p.logins {
+		if time.Since(session.Created) > loginTTL {
 			delete(p.logins, s)
 		}
 	}
-	p.logins[st.State] = time.Now()
+	if len(p.logins) >= 64 {
+		p.loginMu.Unlock()
+		writeErr(w, http.StatusTooManyRequests, "too many pending login sessions")
+		return
+	}
+	p.logins[loginID] = &loginSession{Created: time.Now(), Site: site, State: st.State}
 	p.loginMu.Unlock()
-	log.Printf("panel: 发起 OAuth 添加账号（state=%s...）", st.State[:min(8, len(st.State))])
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State})
+	log.Printf("panel: OAuth login started site=%s", site.Host)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": loginID, "site": input.Site, "product": input.Product})
 }
 
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
@@ -133,15 +191,35 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.loginMu.Lock()
-	_, known := p.logins[state]
-	p.loginMu.Unlock()
-	if !known {
+	session := p.logins[state]
+	if session == nil || time.Since(session.Created) > loginTTL {
+		delete(p.logins, state)
+		p.loginMu.Unlock()
 		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
 		return
 	}
+	if session.Result != nil {
+		result := session.Result
+		p.loginMu.Unlock()
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if session.Busy {
+		p.loginMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"done": false})
+		return
+	}
+	session.Busy = true
+	p.loginMu.Unlock()
+	defer func() {
+		p.loginMu.Lock()
+		session.Busy = false
+		p.loginMu.Unlock()
+	}()
+	query := "?state=" + url.QueryEscape(session.State)
 
 	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
-	tokRaw, _, err := doJSON(http.MethodGet, endpointAuthToken+state, "", nil)
+	tokRaw, _, err := loginJSON(session.Site, http.MethodGet, "/v2/plugin/auth/token"+query, "", "", nil)
 	if err != nil {
 		// pending / 未完成：面板前端继续轮询。
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
@@ -157,6 +235,14 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "waiting for login"})
 		return
 	}
+	if tok.Domain == "" {
+		tok.Domain = session.Site.Host
+	}
+	tokenSite, err := auth.ResolveSite(&auth.Auth{Domain: tok.Domain, AccessToken: tok.AccessToken})
+	if err != nil || tokenSite != session.Site {
+		writeErr(w, http.StatusBadGateway, "login token does not match the selected site and product")
+		return
+	}
 
 	// 完成：取 uid/nickname（失败不阻塞，仅缺展示名）。
 	var acct struct {
@@ -164,7 +250,8 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	}
-	if acctRaw, _, err := doJSON(http.MethodGet, endpointLoginAcct+state, tok.AccessToken, nil); err == nil {
+	acctRaw, _, acctErr := loginJSON(session.Site, http.MethodGet, "/v2/plugin/login/account"+query, tok.AccessToken, tokenSite.Host, nil)
+	if acctErr == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 	if acct.UID == "" {
@@ -184,17 +271,26 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error())
 		return
 	}
-	a := &auth.Auth{
-		AccessToken:  tok.AccessToken,
-		RefreshToken: tok.RefreshToken,
-		ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
-		Domain:       tok.Domain,
-		UID:          acct.UID,
-		EnterpriseID: acct.EnterpriseID,
-		Nickname:     acct.Nickname,
-		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
+	var tokenDoc map[string]json.RawMessage
+	_ = json.Unmarshal(tokRaw, &tokenDoc)
+	tokenDoc["domain"], _ = json.Marshal(tokenSite.Host)
+	if tok.ExpiresIn > 0 {
+		tokenDoc["expiresAt"], _ = json.Marshal(time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix())
 	}
+	normalizedToken, _ := json.Marshal(tokenDoc)
+	doc, _ := json.Marshal(map[string]json.RawMessage{"auth": normalizedToken, "account": acctRaw})
+	a, err := auth.Parse(doc)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, "invalid login credential")
+		return
+	}
+	a.FilePath = filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID))
 	if previous := p.cfg.Pool.AuthByUID(acct.UID); previous != nil {
+		previousSite, err := auth.ResolveSite(previous)
+		if err != nil || previousSite != tokenSite {
+			writeErr(w, http.StatusConflict, "account UID already belongs to a different site or product")
+			return
+		}
 		a.RemoteName = previous.RemoteName
 	}
 	if err := a.SaveNew(); err != nil {
@@ -206,8 +302,10 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
 	checkinMsg := ""
-	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error()
+	if !tokenSite.International {
+		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+			checkinMsg = err.Error()
+		}
 	}
 	remain := int64(-1)
 	if rm, err := p.cfg.Upstream.UserResource(a); err == nil {
@@ -215,15 +313,16 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		p.cfg.Pool.ReenableIfCredits(acct.UID, rm)
 	}
 
-	p.loginMu.Lock()
-	delete(p.logins, state)
-	p.loginMu.Unlock()
-	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q（免重启生效）", acct.UID, acct.Nickname)
-	writeJSON(w, http.StatusOK, map[string]any{
+	result := map[string]any{
 		"done":            true,
 		"uid":             acct.UID,
 		"nickname":        acct.Nickname,
 		"credits":         remain,
 		"checkin_message": checkinMsg,
-	})
+	}
+	p.loginMu.Lock()
+	session.Result = result
+	p.loginMu.Unlock()
+	log.Printf("panel: OAuth account loaded site=%s uid=%s", tokenSite.Host, acct.UID)
+	writeJSON(w, http.StatusOK, result)
 }

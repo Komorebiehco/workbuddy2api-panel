@@ -4,7 +4,6 @@ package upstream
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
@@ -15,24 +14,18 @@ const (
 )
 
 func originRefererFor(a *auth.Auth) string {
-	if host := internationalHost(a); host != "" {
-		return "https://" + host
+	if site, err := auth.ResolveSite(a); err == nil {
+		return "https://" + site.Host
 	}
-	return originRefererCN
+	return ""
 }
 
 // Only route migrated credentials to known product hosts, never to an arbitrary domain.
 func internationalHost(a *auth.Auth) string {
-	if a == nil {
-		return ""
+	if site, err := auth.ResolveSite(a); err == nil && site.International {
+		return site.Host
 	}
-	host := strings.TrimSuffix(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(a.Domain)), "https://"), "/")
-	switch host {
-	case "www.workbuddy.ai", "www.codebuddy.ai":
-		return host
-	default:
-		return ""
-	}
+	return ""
 }
 
 // userAgent 返回当前出站 UA：Client.UserAgent 非空则覆盖（全部出站请求生效），
@@ -53,13 +46,25 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", c.userAgent())
-	if internationalHost(a) == "www.workbuddy.ai" {
+	site, _ := auth.ResolveSite(a)
+	if site.WorkBuddy {
 		if c.UserAgent == "" {
-			req.Header.Set("User-Agent", "WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/2.137.1")
+			name := "WorkBuddy"
+			if site.International {
+				name = "WorkBuddy AI"
+			}
+			req.Header.Set("User-Agent", "WorkBuddy/5.5.2 "+name+"/5.5.2 CLI/2.137.1")
 		}
 		req.Header.Set("X-IDE-Type", "WorkBuddy")
 		req.Header.Set("X-IDE-Name", "WorkBuddy")
 		req.Header.Set("X-IDE-Version", "5.5.2")
+	} else if site.International {
+		if c.UserAgent == "" {
+			req.Header.Set("User-Agent", "CLI/2.149.0 CodeBuddy/2.149.0")
+		}
+		req.Header.Set("X-IDE-Type", "CLI")
+		req.Header.Set("X-IDE-Name", "CLI")
+		req.Header.Set("X-IDE-Version", "2.149.0")
 	}
 }
 
@@ -83,8 +88,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if site, err := auth.ResolveSite(a); err == nil && (a.Domain != "" || site.International || site.WorkBuddy) {
+		req.Header.Set("X-Domain", site.Host)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
@@ -95,6 +100,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth) {
 // UA 语义：默认**不设置**（保持现状，Go 客户端自带默认 UA）；仅当显式配置
 // c.UserAgent 非空才覆盖——避免默认路径给 billing 引入新的 UA 指纹。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
+	if site, err := auth.ResolveSite(a); err == nil && (site.International || site.WorkBuddy) {
+		c.CommonHeaders(req, a)
+	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
@@ -108,8 +116,8 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
 	}
-	if a.Domain != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if site, err := auth.ResolveSite(a); err == nil && (a.Domain != "" || site.International || site.WorkBuddy) {
+		req.Header.Set("X-Domain", site.Host)
 	}
 }
 
@@ -121,7 +129,7 @@ func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}
 	req.Header.Set("X-Auth-Refresh-Source", "workbuddy")
-	if internationalHost(a) != "" {
-		req.Header.Set("X-Domain", a.Domain)
+	if site, err := auth.ResolveSite(a); err == nil && (a.Domain != "" || site.International || site.WorkBuddy) {
+		req.Header.Set("X-Domain", site.Host)
 	}
 }

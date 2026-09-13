@@ -58,12 +58,12 @@ func TestSaveAtomicRoundtrip(t *testing.T) {
 	}
 }
 
-// TestLoadDirLoadsAllValid 不再按 region 过滤：所有可解析的 auth 文件都被加载，
+// TestLoadDirLoadsAllValid 国内与国际的有效 auth 文件均可加载，
 // 解析失败的文件静默跳过。
 func TestLoadDirLoadsAllValid(t *testing.T) {
 	dir := t.TempDir()
 	cn := `{"auth":{"accessToken":"at1","refreshToken":"r","expiresAt":1,"domain":""},"account":{"uid":"cn1"}}`
-	other := `{"auth":{"accessToken":"at2","refreshToken":"r","expiresAt":1,"domain":"example.com"},"account":{"uid":"u2"}}`
+	other := `{"auth":{"accessToken":"at2","refreshToken":"r","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"u2"}}`
 	bad := `not json`
 	os.WriteFile(filepath.Join(dir, "workbuddy-cn1.json"), []byte(cn), 0o600)
 	os.WriteFile(filepath.Join(dir, "workbuddy-u2.json"), []byte(other), 0o600)

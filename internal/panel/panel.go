@@ -63,7 +63,7 @@ type Panel struct {
 	// logins 进行中的 OAuth 设备授权会话（state → 创建时刻）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
-	logins  map[string]time.Time
+	logins  map[string]*loginSession
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -112,7 +112,7 @@ func New(cfg Config) *Panel {
 		mux:     http.NewServeMux(),
 		started: time.Now(),
 		logs:    NewRing(500),
-		logins:  map[string]time.Time{},
+		logins:  map[string]*loginSession{},
 	}
 	p.routes()
 	return p
@@ -184,6 +184,17 @@ func (p *Panel) apiKey() string {
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
+	accounts := p.cfg.Pool.List()
+	sites := make(map[string]any, len(accounts))
+	for _, account := range accounts {
+		site, err := auth.ResolveSite(p.cfg.Pool.AuthByUID(account.UID))
+		if err == nil {
+			sites[account.UID] = map[string]any{
+				"host": site.Host, "international": site.International,
+				"workbuddy": site.WorkBuddy, "growth_supported": !site.International,
+			}
+		}
+	}
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
@@ -200,7 +211,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":              cooling,
 		"disabled":             disabled,
 		"in_flight_full":       inFlightFull,
-		"accounts":             p.cfg.Pool.List(),
+		"accounts":             accounts,
+		"account_sites":        sites,
 	})
 }
 
@@ -276,6 +288,10 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	a := p.cfg.Pool.AuthByUID(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	if site, err := auth.ResolveSite(a); err != nil || site.International {
+		writeErr(w, http.StatusNotImplemented, "国际版账号不支持国内签到与成长任务")
 		return
 	}
 	checkinMsg := ""

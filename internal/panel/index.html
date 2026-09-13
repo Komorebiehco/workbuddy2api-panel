@@ -524,10 +524,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   <div class="dlg">
     <header>
       <h3>添加账号</h3>
-      <div class="hint">浏览器完成腾讯账号登录，网关自动接续签到并载入账号池，无需重启。</div>
     </header>
     <div class="body">
-      <div id="addLoad" class="state"><span class="dots">正在获取授权链接</span></div>
+      <label for="addSite">账号站点</label>
+      <select id="addSite" style="width:100%;margin:8px 0 14px">
+        <option value="cn:cli">国内版 CodeBuddy CLI</option>
+        <option value="cn:workbuddy">国内版 WorkBuddy</option>
+        <option value="intl:workbuddy">国际版 WorkBuddy</option>
+        <option value="intl:cli">国际版 CodeBuddy CLI</option>
+      </select>
+      <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
       <div id="addReady" hidden>
         <div class="state">在浏览器打开以下链接并登录：</div>
         <div class="url" id="addUrl"></div>
@@ -538,6 +544,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </div>
     <footer>
       <span class="grow"></span>
+      <button id="btnStartLogin" class="primary">获取授权链接</button>
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>

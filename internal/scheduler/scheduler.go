@@ -260,9 +260,10 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-			log.Printf("checkin %s: %v", st.UID, err)
-			// 已签到等业务错误也继续走余额查询
+		if supportsGrowth(a) {
+			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+				log.Printf("checkin %s: %v", st.UID, err)
+			}
 		}
 		remain, err := s.cfg.Upstream.UserResource(a)
 		if err != nil {
@@ -286,7 +287,7 @@ func (s *Scheduler) RunActivityNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessToken == "" {
+		if a == nil || a.AccessToken == "" || !supportsGrowth(a) {
 			continue
 		}
 		if !first {

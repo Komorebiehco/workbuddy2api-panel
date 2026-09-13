@@ -5,6 +5,7 @@ let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
+let loginGeneration = 0, loginPollBusy = false;
 let refTimer = null;
 
 const $ = id => document.getElementById(id);
@@ -113,6 +114,9 @@ function renderAccounts(list) {
   }
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
+    const site = (overviewData.account_sites || {})[s.uid];
+    const siteLabel = site ? (site.international ? '国际版 ' : '国内版 ') + (site.workbuddy ? 'WorkBuddy' : 'CodeBuddy CLI') : '';
+    const growthDisabled = site && !site.growth_supported ? ' disabled title="国际版不支持国内签到与成长任务"' : '';
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0);
     let cls = '', tag;
@@ -128,16 +132,16 @@ function renderAccounts(list) {
     const frozen = s.disabled || cool > 0;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + '</div><div class="id">' + esc(short) + '</div><div class="id">' + esc(siteLabel) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + Math.round((s.credits || 0) / maxCred * 100) + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
+        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + growthDisabled + '>签到</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
-        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '"' + growthDisabled + '>任务</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
@@ -349,27 +353,48 @@ $('cfgForm').onsubmit = async ev => {
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');
-  $('addLoad').hidden = false; $('addReady').hidden = true;
+  resetLogin();
+}
+function resetLogin() {
+  stopPoll();
+  $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
+  $('btnStartLogin').hidden = false;
+}
+function startLogin() {
   stopPoll();
-  api('login/start', { method: 'POST' }).then(r => {
+  const generation = loginGeneration;
+  const [site, product] = $('addSite').value.split(':');
+  $('addLoad').hidden = false; $('addReady').hidden = true;
+  $('addErr').hidden = true; $('btnStartLogin').hidden = true;
+  $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
+  api('login/start', { method: 'POST', body: JSON.stringify({ site, product }) }).then(r => {
+    if (generation !== loginGeneration) return;
     loginState = r.state;
     $('addUrl').textContent = r.url;
     $('addLoad').hidden = true; $('addReady').hidden = false;
     $('btnCopyUrl').hidden = false; $('btnOpenUrl').hidden = false;
     loginTimer = setInterval(pollLogin, 3000);
   }).catch(e => {
+    if (generation !== loginGeneration) return;
     $('addLoad').hidden = true;
     $('addErr').hidden = false;
     $('addErr').textContent = e.message;
+    $('btnStartLogin').hidden = false;
   });
 }
-function stopPoll() { if (loginTimer) { clearInterval(loginTimer); loginTimer = null; } }
+function stopPoll() {
+  if (loginTimer) { clearInterval(loginTimer); loginTimer = null; }
+  loginState = null; loginGeneration++; loginPollBusy = false;
+}
 async function pollLogin() {
-  if (!loginState) return;
+  if (!loginState || loginPollBusy) return;
+  const state = loginState, generation = loginGeneration;
+  loginPollBusy = true;
   try {
-    const r = await api('login/poll?state=' + encodeURIComponent(loginState));
+    const r = await api('login/poll?state=' + encodeURIComponent(state));
+    if (generation !== loginGeneration) return;
     if (r.done) {
       stopPoll();
       $('addReady').hidden = true;
@@ -378,15 +403,20 @@ async function pollLogin() {
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
+    if (generation !== loginGeneration) return;
     stopPoll();
     $('addReady').hidden = true;
     $('addErr').hidden = false;
     $('addErr').textContent = e.message + '（关闭后重新添加）';
+  } finally {
+    if (generation === loginGeneration) loginPollBusy = false;
   }
 }
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
-$('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
+$('addSite').onchange = resetLogin;
+$('btnStartLogin').onclick = startLogin;
+$('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank', 'noopener,noreferrer');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 

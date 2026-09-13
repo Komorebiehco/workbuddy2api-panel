@@ -397,16 +397,15 @@ func TestDailyCheckinAlready(t *testing.T) {
 	}
 }
 
-func TestBasesAlwaysCN(t *testing.T) {
+func TestBasesRejectUnknownDomain(t *testing.T) {
 	c := testClient(nil)
 	cn := &auth.Auth{Domain: ""}
 	other := &auth.Auth{Domain: "example.com"}
 	if c.chatBase(cn) != "https://chat.example" || c.billingBase(cn) != "https://billing.example" {
 		t.Error("cn bases wrong")
 	}
-	// 恒 CN：domain 不同不改变上游 host。
-	if c.chatBase(other) != c.chatBase(cn) || c.billingBase(other) != c.billingBase(cn) {
-		t.Error("bases must be CN regardless of domain")
+	if c.chatBase(other) != "" || c.billingBase(other) != "" {
+		t.Error("unknown domains must not fall back to another credential site")
 	}
 }
 

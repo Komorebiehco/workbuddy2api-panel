@@ -200,6 +200,7 @@ var staticModels = []map[string]any{
 // dynamicModelsCache 动态模型缓存。
 var dynamicModelsCache struct {
 	sync.RWMutex
+	key      string
 	ids      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
@@ -210,7 +211,7 @@ const (
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
+// models returns the union of current account catalogs.
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
@@ -222,7 +223,7 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // supported_efforts/default_effort 透出上游实际能力（客户端据此渲染思考档位选择）；
 // 未知（静态回退表 / 上游未返回）时省略字段，客户端按自身默认处理。
 func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
+	if infos := h.fetchDynamicModels(); infos != nil {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
 			entry := map[string]any{
@@ -256,41 +257,85 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		return out
 	}
-	return staticModels
+	for _, st := range h.cfg.Pool.List() {
+		a := h.cfg.Pool.AuthByUID(st.UID)
+		if site, err := auth.ResolveSite(a); err == nil && !site.International && !st.Disabled {
+			return staticModels
+		}
+	}
+	return []map[string]any{}
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
-// 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
+// The cache identity includes the handler and current account set, so removal or
+// region changes cannot reuse another pool's catalog.
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
+	var accounts []*auth.Auth
+	var identities [][4]string
+	for _, st := range h.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := h.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		if site, err := auth.ResolveSite(a); err == nil {
+			accounts = append(accounts, a)
+			identities = append(identities, [4]string{site.Host, a.UID, a.EnterpriseID, fmt.Sprintf("%p", a)})
+		}
+	}
+	rawKey, _ := json.Marshal(identities)
+	key := fmt.Sprintf("%p:%s", h, rawKey)
 	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
+	if dynamicModelsCache.key == key && dynamicModelsCache.ids != nil && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
 		out := dynamicModelsCache.ids
 		dynamicModelsCache.RUnlock()
 		return out
 	}
 	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
+	if dynamicModelsCache.key == key && !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
 		dynamicModelsCache.RUnlock()
 		return nil
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
-	if acct == nil {
+	if len(accounts) == 0 {
 		return nil
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
-		h.cfg.Pool.NoteError(acct.UID)
+	infos := make([]upstream.ModelInfo, 0)
+	seen := map[string]bool{}
+	succeeded := false
+	partial := false
+	for _, acct := range accounts {
+		models, err := h.cfg.Upstream.FetchModels(acct)
+		if err != nil {
+			partial = true
+			continue
+		}
+		succeeded = true
+		for _, model := range models {
+			if !seen[model.ID] {
+				infos = append(infos, model)
+				seen[model.ID] = true
+			}
+		}
+	}
+	if !succeeded {
 		dynamicModelsCache.Lock()
+		dynamicModelsCache.key = key
+		dynamicModelsCache.ids = nil
+		dynamicModelsCache.fetched = time.Time{}
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
 		return nil
 	}
 	dynamicModelsCache.Lock()
+	dynamicModelsCache.key = key
 	dynamicModelsCache.ids = infos
 	dynamicModelsCache.fetched = time.Now()
+	if partial {
+		dynamicModelsCache.fetched = time.Now().Add(-dynamicModelsTTL + modelsFetchFailCooldown)
+	}
 	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
 	return infos
@@ -324,6 +369,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	sites := map[string]bool{}
+	for _, account := range h.cfg.Pool.List() {
+		if site, err := auth.ResolveSite(h.cfg.Pool.AuthByUID(account.UID)); err == nil && !account.Disabled {
+			sites[site.Host] = true
+		}
+	}
+	if len(sites) > 1 {
+		h.fetchDynamicModels()
+	}
+	for _, account := range h.cfg.Pool.List() {
+		if a := h.cfg.Pool.AuthByUID(account.UID); a != nil && !h.cfg.Upstream.ModelAvailable(a, peek.Model) {
+			tried[account.UID] = true
+		}
+	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
@@ -331,7 +390,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Session != nil {
 		sessKey = session.ExtractKey(body)
 		if sessKey != "" {
-			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
+			if uid, ok := h.cfg.Session.Resolve(sessKey); ok && !tried[uid] {
 				stickyUID = uid
 			}
 		}

@@ -37,7 +37,7 @@ import (
 )
 
 const (
-	desktopReportPath   = "/v2/report"
+	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
 	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
 	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
@@ -73,7 +73,7 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"ideVersion":   "5.5.6",
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
-		"extName":     "workbuddy-desktop",
+		"extName":      "workbuddy-desktop",
 		"extVersion":   "5.5.6",
 		"os":           "win32",
 		"arch":         "x64",
@@ -88,6 +88,9 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 // ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入并覆盖同名键。
 func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error {
+	if err := requireDomestic(a); err != nil {
+		return err
+	}
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
 	}
@@ -156,7 +159,7 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 			"isContextTruncated": false, "currentStepCount": 1,
 			"traceId": uuid(), "rootRequestId": requestID,
 			"parentConversationId": conversationID,
-			"agentName": "cli", "agentType": "main",
+			"agentName":            "cli", "agentType": "main",
 		}),
 		mk("chat_request_send", map[string]any{
 			"inputLength": 24, "isPlan": false, "isAutoExecuteTerminal": false,
@@ -167,8 +170,8 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 			"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
 			"traceId": uuid(), "rootRequestId": requestID,
 			"parentConversationId": conversationID,
-			"agentName": "cli", "agentType": "main",
-			"codebuddy.session_id":             conversationID,
+			"agentName":            "cli", "agentType": "main",
+			"codebuddy.session_id":              conversationID,
 			"codebuddy.conversation_request_id": requestID,
 		}),
 		mk("chat_message_response", map[string]any{
@@ -178,16 +181,16 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 			"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
 			"firstTokenAt": time.Now().UnixMilli(), "traceId": uuid(),
 			"conversationId": conversationID,
-			"rootRequestId": requestID, "parentConversationId": conversationID,
+			"rootRequestId":  requestID, "parentConversationId": conversationID,
 			"agentName": "cli", "agentType": "main",
-			"codebuddy.session_id":             conversationID,
+			"codebuddy.session_id":              conversationID,
 			"codebuddy.conversation_request_id": requestID,
 		}),
 		mk("chat_message_status", map[string]any{
 			"messageId": messageID + "-assistant", "messageErrorCode": "0",
 			"traceId": uuid(), "rootRequestId": requestID,
 			"parentConversationId": conversationID,
-			"agentName": "cli", "agentType": "main",
+			"agentName":            "cli", "agentType": "main",
 		}),
 		mk("chat_request_response", map[string]any{
 			"mode": "craft", "toolCallCount": 0,
@@ -203,6 +206,9 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 // 和品主题 resource_key 为 "theme-tkmw7j"，浅色 "light"、深色 "dark"）。纯 API set 不计
 // Hp_Appearance 分（需客户端切主题后真实活跃），保留供调色/还原与后续验证用。
 func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
+	if err := requireDomestic(a); err != nil {
+		return err
+	}
 	body := map[string]string{"kind": "theme", "resource_key": resourceKey}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -263,6 +269,9 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
+	if err := requireDomestic(a); err != nil {
+		return err
+	}
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
@@ -511,7 +520,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 var idRegex = regexp.MustCompile(`^(cmb-)?[0-9a-f]{32}$`)
 
 // DesktopExpertSummonSequence 构造「召唤平台专家」事件组（expert_summon_click 等），
-// 载荷对齐真实抓包样本（Sunny row 2644）。需配合 DesktopChatWithExpert + 
+// 载荷对齐真实抓包样本（Sunny row 2644）。需配合 DesktopChatWithExpert +
 // DesktopExpertActualUseEvent 完成一次完整「召唤+使用」。
 func DesktopExpertSummonSequence(e MarketExpert) []DesktopEvent {
 	cat := "expert-all"
@@ -572,7 +581,7 @@ func desktopExpertActualUse(e MarketExpert, conversationID, requestID string) De
 	}
 	return DesktopEvent{
 		"eventCode": "expert_actual_use",
-		"id": e.ExpertID, "name": e.DisplayNameZH, "expertTitle": e.ProfessionZH,
+		"id":        e.ExpertID, "name": e.DisplayNameZH, "expertTitle": e.ProfessionZH,
 		"type": cat, "expertType": e.ExpertType, "source": "builtin", "version": ver,
 		"cost": 9000, "characterCount": 14,
 		"conversationId": conversationID, "requestId": requestID, "messageId": "msg-" + requestID[len(requestID)-8:],

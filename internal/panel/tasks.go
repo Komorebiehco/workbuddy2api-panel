@@ -16,11 +16,15 @@ import (
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
 var acceptBatchGap = 1050 * time.Millisecond
 
-// accountByUID 取账号凭证；不存在时写 404 并返回 nil。
+// accountByUID is used only by growth-task handlers.
 func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
 	a := p.cfg.Pool.AuthByUID(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
+		return nil
+	}
+	if site, err := auth.ResolveSite(a); err != nil || site.International {
+		writeErr(w, http.StatusNotImplemented, "国际版账号不支持国内成长任务")
 		return nil
 	}
 	return a

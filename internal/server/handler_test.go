@@ -940,7 +940,7 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	}
 }
 
-func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
+func TestModelsFetchFailureDoesNotDisableChat(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = nil
@@ -949,7 +949,7 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 	dynamicModelsCache.Unlock()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	p.SetBreaker(1, time.Hour, time.Hour) // 熔断阈值 1：一次 fetch 失败即熔断
+	p.SetBreaker(1, time.Hour, time.Hour)
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 500, `boom`, false
 	})
@@ -960,8 +960,8 @@ func TestModelsFetchFailurePenalizesAccount(t *testing.T) {
 		t.Fatalf("code=%d (static fallback)", rec.Code)
 	}
 	st, _ := p.Status("u1")
-	if !st.Cooling {
-		t.Fatalf("fetch failure should trip breaker with threshold=1: %+v", st)
+	if st.Cooling || st.ErrTotal != 0 {
+		t.Fatalf("catalog failure should not disable an otherwise usable account: %+v", st)
 	}
 }
 
