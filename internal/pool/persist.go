@@ -4,6 +4,7 @@ package pool
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -31,36 +32,55 @@ type StoreSnapshotter interface {
 	LoadState() ([]byte, bool)
 }
 
+type durableSnapshotter interface {
+	SaveStateSync([]byte) error
+	LoadStateSync() ([]byte, bool, error)
+}
+
 // defaultIdle* 闲置补偿默认参数（claude-api selectWeightedRandom 参考口径）。
-func (p *Pool) RestoreFromSnapshot() {
+func (p *Pool) RestoreFromSnapshot() error {
 	store := p.store
 	if store == nil || p.stateFp == "" {
-		return
+		return nil
 	}
 	localInfo, localErr := os.Stat(p.stateFp)
-	raw, ok := store.LoadState()
+	var raw []byte
+	var ok bool
+	if durable, supported := store.(durableSnapshotter); supported {
+		var err error
+		raw, ok, err = durable.LoadStateSync()
+		if err != nil {
+			return err
+		}
+	} else {
+		raw, ok = store.LoadState()
+	}
 	if !ok {
 		if localErr == nil {
 			log.Printf("pool: 恢复来源=本地 state.json（无 Redis 快照）")
 		}
-		return
+		return nil
 	}
 	var snap snapshot
 	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
+		if _, durable := store.(durableSnapshotter); durable {
+			return fmt.Errorf("persistent pool snapshot is invalid")
+		}
 		// 快照无 savedAt：无法比较新旧，本地优先。
 		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
-		return
+		return nil
 	}
-	if localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
+	if os.IsNotExist(localErr) || localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
 		// 快照不早于本地 → 采用快照。
 		p.mu.Lock()
 		p.applySnapshotLocked(snap)
 		p.mu.Unlock()
 		p.dirty.Store(true)
-		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
-		return
+		log.Printf("pool: restored remote snapshot (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
+		return nil
 	}
 	log.Printf("pool: 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
+	return nil
 }
 
 // Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
@@ -155,17 +175,23 @@ func (p *Pool) saveLocked() {
 		p.notePersistFail(err)
 		return
 	}
-	if p.persistFails > 0 {
-		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
-		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
-		p.persistFails = 0
-	}
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
 	if p.store != nil {
 		snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: time.Now()})
 		if err == nil {
-			p.store.SaveState(snapRaw)
+			if durable, ok := p.store.(durableSnapshotter); ok {
+				if err := durable.SaveStateSync(snapRaw); err != nil {
+					p.notePersistFail(err)
+					return
+				}
+			} else {
+				p.store.SaveState(snapRaw)
+			}
 		}
+	}
+	if p.persistFails > 0 {
+		log.Printf("pool: persistence recovered after %d failure(s)", p.persistFails)
+		p.persistFails = 0
 	}
 }
 
@@ -175,6 +201,7 @@ func (p *Pool) saveLocked() {
 // 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
 // "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
 func (p *Pool) notePersistFail(err error) {
+	p.dirty.Store(true)
 	if p.persistFails == 0 {
 		log.Printf("pool: state.json 落盘失败: %v", err)
 	} else if p.persistFails%persistLogEvery == 0 {

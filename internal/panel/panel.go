@@ -14,10 +14,10 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -313,26 +313,22 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain})
 }
 
-// accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
+// accountRemove 移除账号：先写远端 deleted tombstone，再删本地缓存，
+// 最后出池（立即落盘 state），避免重启时旧缓存把账号复活。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.Remove(uid)
+	a := p.cfg.Pool.AuthByUID(uid)
 	if a == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	fileMsg := ""
-	if a.FilePath != "" {
-		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
-			fileMsg = err.Error()
-		}
-	}
-	if fileMsg != "" {
-		log.Printf("panel: remove uid=%s（auth 文件删除失败: %s）", uid, fileMsg)
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file_error": fileMsg})
+	if err := auth.DeleteStored(a); err != nil {
+		log.Printf("panel: remove uid=%s（持久化删除失败: %v）", uid, err)
+		writeErr(w, http.StatusBadGateway, "delete credential: "+err.Error())
 		return
 	}
-	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
+	p.cfg.Pool.Remove(uid)
+	log.Printf("panel: remove uid=%s（已写远端删除标记、出池并删除本地缓存）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

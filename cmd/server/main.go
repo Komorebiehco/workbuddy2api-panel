@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -34,14 +36,32 @@ func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
 
+	remoteStore, err := openPersistence()
+	if err != nil {
+		log.Fatalf("init persistence: %v", err)
+	}
+	var documents documentStore
+	if remoteStore != nil {
+		documents = remoteStore
+		auth.SetRemoteStore(remoteStore)
+		defer func() {
+			auth.SetRemoteStore(nil)
+			_ = remoteStore.Close()
+		}()
+		if err := restoreConfig(*cfgPath, documents); err != nil {
+			log.Fatalf("restore persistent config: %v", err)
+		}
+		log.Printf("encrypted Supabase persistence enabled for credentials, config and pool state")
+	}
+
 	cfg, err := Load(*cfgPath)
 	if err != nil {
 		// errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
 		if errors.Is(err, fs.ErrNotExist) {
 			// 首次运行：目录下没有配置 → 自动落一份推荐配置（含随机 api_key）再加载。
 			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
-			if key, werr := WriteDefault(*cfgPath); werr == nil {
-				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
+			if _, werr := WriteDefault(*cfgPath); werr == nil {
+				log.Printf("config %s 不存在，已生成推荐配置（密钥仅保存在配置文件中）", *cfgPath)
 				cfg, err = Load(*cfgPath)
 			}
 			if err != nil {
@@ -55,11 +75,51 @@ func main() {
 		}
 	}
 
+	if documents != nil {
+		// Seed once, including env overrides. Subsequent boots restore the encrypted document.
+		if _, exists, err := documents.LoadDocument("config"); err != nil {
+			log.Fatalf("load config persistence: %v", err)
+		} else if !exists {
+			raw, err := json.MarshalIndent(cfg, "", "  ")
+			if err != nil {
+				log.Fatalf("serialize config: %v", err)
+			}
+			if err := documents.SaveDocument("config", raw); err != nil {
+				log.Fatalf("seed config persistence: %v", err)
+			}
+			if err := writeConfigCache(*cfgPath, raw); err != nil {
+				log.Fatalf("cache initial config: %v", err)
+			}
+		}
+	}
+
 	auths, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
 	}
-	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+	if remoteStore != nil {
+		localAuths := auths
+		snapshot, restoreErr := remoteStore.RestoreDir(cfg.AuthDir)
+		if restoreErr != nil {
+			log.Fatalf("restore credentials persistence: %v", restoreErr)
+		}
+		auths = snapshot.Auths
+		imported := 0
+		// Once the remote has any record, it is authoritative, including arbitrary-name
+		// legacy tombstones. Local files must never be automatically re-imported.
+		if !snapshot.HasRecords {
+			for _, a := range localAuths {
+				if err := remoteStore.PutAuth(a); err != nil {
+					log.Fatalf("credential migration failed: %v", err)
+				}
+				imported++
+				auths = append(auths, a)
+			}
+		}
+		log.Printf("loaded %d account(s) from encrypted remote (%d local cache import(s))", len(snapshot.Auths), imported)
+	} else {
+		log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
+	}
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
@@ -67,8 +127,13 @@ func main() {
 	p := pool.New(cfg.StateFile)
 	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
 	p.SetStore(store)
-	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
-	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+	if remoteStore != nil {
+		p.SetStore(remoteStore)
+	}
+	if err := p.RestoreFromSnapshot(); err != nil {
+		log.Fatalf("restore pool persistence: %v", err)
+	}
+	p.SyncToDir(auths) // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
@@ -187,7 +252,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, documents)
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -210,6 +275,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go retryCredentialSaves(ctx, p)
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
@@ -257,7 +323,11 @@ func panelListenPath(listen string) string {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+var configSaveMu sync.Mutex
+
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, stores ...documentStore) ([]string, error) {
+	configSaveMu.Lock()
+	defer configSaveMu.Unlock()
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -277,6 +347,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, err
 	}
+	if key := os.Getenv("WB2A_API_KEY"); key != "" && newCfg.APIKey != key {
+		return nil, fmt.Errorf("api_key is managed by WB2A_API_KEY; update the Render environment to change it")
+	}
 
 	// 3) 落盘（原子替换）。
 	out, err := json.MarshalIndent(merged, "", "  ")
@@ -286,6 +359,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return nil, fmt.Errorf("write config: %w", err)
+	}
+	if len(stores) > 0 && stores[0] != nil {
+		if err := stores[0].SaveDocument("config", out); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		return nil, fmt.Errorf("replace config: %w", err)
@@ -357,4 +435,13 @@ func mergedJSON(m map[string]any) []byte {
 		return []byte("{}")
 	}
 	return b
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

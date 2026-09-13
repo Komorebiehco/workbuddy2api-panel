@@ -194,7 +194,10 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		Nickname:     acct.Nickname,
 		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
 	}
-	if err := a.SaveAtomic(); err != nil {
+	if previous := p.cfg.Pool.AuthByUID(acct.UID); previous != nil {
+		a.RemoteName = previous.RemoteName
+	}
+	if err := a.SaveNew(); err != nil {
 		writeErr(w, http.StatusInternalServerError, "save auth: "+err.Error())
 		return
 	}

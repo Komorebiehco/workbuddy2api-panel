@@ -317,6 +317,18 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 `WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
+### Render / Supabase 凭证持久化
+
+配置 `WB2A_CREDENTIALS_DATABASE_URL` 与
+`WB2A_CREDENTIALS_ENCRYPTION_KEY` 后，账号凭证会使用 Fernet 加密保存到
+Supabase PostgreSQL 的 `codebuddy_credentials` 表；`auths/` 仅作为本地热缓存。
+启动时远端凭证会恢复到 `auths/`，面板登录、token 刷新和删除会同步更新远端。
+
+为兼容旧版 `codebuddy2api` 的既有部署，也接受同值的
+`CODEBUDDY_CREDENTIALS_DATABASE_URL` 与
+`CODEBUDDY_CREDENTIALS_ENCRYPTION_KEY`。Render Free 实例重启或重新部署后，
+凭证仍从 Supabase 恢复，不依赖本地磁盘。
+
 ## 核心行为语义
 
 ### 系统提示词体系
